@@ -1,0 +1,970 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+import sqlite3
+from datetime import datetime
+
+DB_NAME = "registrar_queue.db"
+
+
+def connect_db():
+    return sqlite3.connect(DB_NAME)
+
+
+def setup_database():
+    conn = connect_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS students (
+            student_id TEXT PRIMARY KEY,
+            full_name TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS service_windows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            window_name TEXT NOT NULL UNIQUE,
+            active INTEGER DEFAULT 1
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS queue_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            queue_number TEXT UNIQUE,
+            student_id TEXT NOT NULL,
+            service TEXT NOT NULL,
+            registered_at TEXT NOT NULL,
+            status TEXT DEFAULT 'Waiting',
+            window_id INTEGER,
+            FOREIGN KEY (student_id) REFERENCES students(student_id),
+            FOREIGN KEY (window_id) REFERENCES service_windows(id)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS staff (
+            username TEXT PRIMARY KEY,
+            password TEXT NOT NULL,
+            role TEXT NOT NULL
+        )
+    """)
+
+    cur.execute(
+        "INSERT OR IGNORE INTO staff VALUES (?, ?, ?)",
+        ("admin", "admin123", "Admin")
+    )
+    cur.execute(
+        "INSERT OR IGNORE INTO staff VALUES (?, ?, ?)",
+        ("staff", "staff123", "Staff")
+    )
+
+    for name in ("Window 1", "Window 2", "Window 3"):
+        cur.execute(
+            "INSERT OR IGNORE INTO service_windows (window_name, active) VALUES (?, 1)",
+            (name,)
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def get_records(status=None, search=None):
+    conn = connect_db()
+    cur = conn.cursor()
+
+    query = """
+        SELECT q.queue_number, s.student_id, s.full_name,
+               q.service, q.registered_at, q.status,
+               COALESCE(w.window_name, '-'), q.id
+        FROM queue_records q
+        JOIN students s ON q.student_id = s.student_id
+        LEFT JOIN service_windows w ON q.window_id = w.id
+        WHERE 1=1
+    """
+    params = []
+
+    if status and status != "All":
+        query += " AND q.status = ?"
+        params.append(status)
+
+    if search:
+        query += """
+            AND (q.queue_number LIKE ? OR s.student_id LIKE ?
+                 OR s.full_name LIKE ? OR q.service LIKE ?)
+        """
+        term = f"%{search}%"
+        params.extend([term, term, term, term])
+
+    query += """
+        ORDER BY
+            CASE q.status
+                WHEN 'Serving' THEN 1
+                WHEN 'Waiting' THEN 2
+                WHEN 'Completed' THEN 3
+                ELSE 4
+            END,
+            q.id
+    """
+
+    cur.execute(query, params)
+    records = cur.fetchall()
+    conn.close()
+    return records
+
+
+def get_statistics():
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM queue_records")
+    total = cur.fetchone()[0]
+
+    counts = {}
+    for status in ("Waiting", "Serving", "Completed", "Cancelled"):
+        cur.execute(
+            "SELECT COUNT(*) FROM queue_records WHERE status = ?",
+            (status,)
+        )
+        counts[status] = cur.fetchone()[0]
+
+    conn.close()
+    return total, counts
+
+
+def get_windows(active_only=False):
+    conn = connect_db()
+    cur = conn.cursor()
+
+    query = """
+        SELECT id, window_name, active
+        FROM service_windows
+    """
+    if active_only:
+        query += " WHERE active = 1"
+    query += " ORDER BY id"
+
+    cur.execute(query)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_window_status(window_id):
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM queue_records WHERE window_id = ? AND status = 'Serving'",
+        (window_id,)
+    )
+    serving = cur.fetchone()
+    conn.close()
+    return serving is not None
+
+
+def next_queue_number():
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute("SELECT MAX(id) FROM queue_records")
+    result = cur.fetchone()[0]
+    conn.close()
+    return f"R{(result or 0) + 1:03d}"
+
+
+class RegistrarApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("School Registrar Queueing Management System")
+        self.root.geometry("1000x650")
+        self.root.minsize(850, 550)
+
+        self.current_window_id = None
+        self.current_username = None
+
+        self.main_menu()
+
+    def clear_screen(self):
+        for widget in self.root.winfo_children():
+            widget.destroy()
+
+    def heading(self, title):
+        tk.Label(
+            self.root,
+            text=title,
+            font=("Arial", 16, "bold")
+        ).pack(pady=12)
+
+    def main_menu(self):
+        self.clear_screen()
+        self.heading("SCHOOL REGISTRAR QUEUEING MANAGEMENT SYSTEM")
+
+        frame = tk.Frame(self.root)
+        frame.pack(expand=True)
+
+        tk.Button(
+            frame, text="Student Registration", width=30,
+            command=self.student_registration
+        ).pack(pady=8)
+
+        tk.Button(
+            frame, text="Staff Login", width=30,
+            command=lambda: self.login("Staff")
+        ).pack(pady=8)
+
+        tk.Button(
+            frame, text="Admin Login", width=30,
+            command=lambda: self.login("Admin")
+        ).pack(pady=8)
+
+        tk.Button(
+            frame, text="Exit", width=30,
+            command=self.root.destroy
+        ).pack(pady=8)
+
+    def student_registration(self):
+        self.clear_screen()
+        self.heading("STUDENT REGISTRATION")
+
+        form = tk.Frame(self.root)
+        form.pack(pady=15)
+
+        tk.Label(form, text="Student ID:").grid(
+            row=0, column=0, sticky="e", padx=5, pady=8
+        )
+        student_id = tk.Entry(form, width=35)
+        student_id.grid(row=0, column=1, pady=8)
+
+        tk.Label(form, text="Full Name:").grid(
+            row=1, column=0, sticky="e", padx=5, pady=8
+        )
+        full_name = tk.Entry(form, width=35)
+        full_name.grid(row=1, column=1, pady=8)
+
+        tk.Label(form, text="Service:").grid(
+            row=2, column=0, sticky="e", padx=5, pady=8
+        )
+        service = ttk.Combobox(
+            form,
+            values=[
+                "Enrollment",
+                "Document Request",
+                "Student Records",
+                "General Inquiry"
+            ],
+            state="readonly",
+            width=32
+        )
+        service.grid(row=2, column=1, pady=8)
+        service.current(0)
+
+        def register():
+            sid = student_id.get().strip()
+            name = full_name.get().strip()
+            selected_service = service.get()
+
+            if not sid or not name or not selected_service:
+                messagebox.showerror(
+                    "Error", "Please complete all fields."
+                )
+                return
+
+            conn = connect_db()
+            cur = conn.cursor()
+
+            cur.execute(
+                "SELECT student_id FROM students WHERE student_id = ?",
+                (sid,)
+            )
+            existing_student = cur.fetchone()
+
+            if existing_student:
+                cur.execute(
+                    "UPDATE students SET full_name = ? WHERE student_id = ?",
+                    (name, sid)
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO students (student_id, full_name) VALUES (?, ?)",
+                    (sid, name)
+                )
+
+            queue_number = next_queue_number()
+
+            cur.execute("""
+                INSERT INTO queue_records
+                (queue_number, student_id, service, registered_at, status)
+                VALUES (?, ?, ?, ?, 'Waiting')
+            """, (
+                queue_number, sid, selected_service,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ))
+
+            conn.commit()
+            conn.close()
+
+            messagebox.showinfo(
+                "Registration Successful",
+                f"Your queue number is {queue_number}.\n\n"
+                f"Service: {selected_service}\n\n"
+                "Please wait for your number to be called."
+            )
+
+            self.student_registration()
+
+        tk.Button(
+            self.root, text="Get Queue Number", width=25,
+            command=register
+        ).pack(pady=8)
+
+        tk.Button(
+            self.root, text="Back", width=25,
+            command=self.main_menu
+        ).pack(pady=5)
+
+    def login(self, required_role):
+        self.clear_screen()
+        self.heading(f"{required_role.upper()} LOGIN")
+
+        form = tk.Frame(self.root)
+        form.pack(pady=25)
+
+        tk.Label(form, text="Username:").grid(
+            row=0, column=0, padx=5, pady=8, sticky="e"
+        )
+        username = tk.Entry(form, width=30)
+        username.grid(row=0, column=1, pady=8)
+
+        tk.Label(form, text="Password:").grid(
+            row=1, column=0, padx=5, pady=8, sticky="e"
+        )
+        password = tk.Entry(form, show="*", width=30)
+        password.grid(row=1, column=1, pady=8)
+
+        def authenticate():
+            user = username.get().strip()
+            pwd = password.get()
+
+            conn = connect_db()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT role FROM staff WHERE username = ? AND password = ?",
+                (user, pwd)
+            )
+            result = cur.fetchone()
+            conn.close()
+
+            if not result or result[0] != required_role:
+                messagebox.showerror(
+                    "Login Failed",
+                    "Invalid username, password, or account type."
+                )
+                return
+
+            self.current_username = user
+
+            if required_role == "Admin":
+                self.admin_dashboard()
+            else:
+                self.window_selection()
+
+        tk.Button(
+            self.root, text="Login", width=25,
+            command=authenticate
+        ).pack(pady=8)
+
+        tk.Button(
+            self.root, text="Back", width=25,
+            command=self.main_menu
+        ).pack(pady=5)
+
+    def window_selection(self):
+        self.clear_screen()
+        self.heading("SELECT SERVICE WINDOW")
+
+        windows = get_windows(active_only=True)
+
+        if not windows:
+            tk.Label(
+                self.root, text="No active service windows available."
+            ).pack(pady=15)
+
+        selected = tk.StringVar()
+
+        choices = []
+        for window_id, name, active in windows:
+            status = "Serving" if get_window_status(window_id) else "Available"
+            choices.append((f"{name} - {status}", window_id))
+
+        combo = ttk.Combobox(
+            self.root,
+            values=[item[0] for item in choices],
+            state="readonly",
+            width=35
+        )
+        combo.pack(pady=10)
+
+        if choices:
+            combo.current(0)
+
+        def open_window():
+            index = combo.current()
+
+            if index < 0:
+                messagebox.showerror(
+                    "Error", "Please select a service window."
+                )
+                return
+
+            window_id = choices[index][1]
+
+            self.current_window_id = window_id
+            self.staff_dashboard()
+
+        tk.Button(
+            self.root, text="Open Selected Window", width=25,
+            command=open_window
+        ).pack(pady=8)
+
+        tk.Button(
+            self.root, text="Refresh Windows", width=25,
+            command=self.window_selection
+        ).pack(pady=5)
+
+        tk.Button(
+            self.root, text="Logout", width=25,
+            command=self.main_menu
+        ).pack(pady=5)
+
+    def staff_dashboard(self):
+        self.clear_screen()
+
+        windows = get_windows()
+        window_name = next(
+            (name for wid, name, active in windows
+             if wid == self.current_window_id),
+            "Unknown Window"
+        )
+
+        self.heading(f"STAFF DASHBOARD - {window_name}")
+
+        current_frame = tk.LabelFrame(
+            self.root, text="Currently Serving", padx=10, pady=10
+        )
+        current_frame.pack(fill="x", padx=15, pady=5)
+
+        conn = connect_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT q.id, q.queue_number, s.student_id, s.full_name, q.service
+            FROM queue_records q
+            JOIN students s ON q.student_id = s.student_id
+            WHERE q.window_id = ? AND q.status = 'Serving'
+        """, (self.current_window_id,))
+        current = cur.fetchone()
+        conn.close()
+
+        if current:
+            tk.Label(
+                current_frame,
+                text=f"Queue Number: {current[1]}\n"
+                     f"Student ID: {current[2]}\n"
+                     f"Student Name: {current[3]}\n"
+                     f"Service: {current[4]}",
+                justify="left"
+            ).pack(anchor="w")
+        else:
+            tk.Label(
+                current_frame, text="No student is currently being served."
+            ).pack(anchor="w")
+
+        def update_status(new_status):
+            if not current:
+                messagebox.showerror(
+                    "Error", "There is no student currently being served."
+                )
+                return
+
+            conn = connect_db()
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE queue_records SET status = ? WHERE id = ?",
+                (new_status, current[0])
+            )
+            conn.commit()
+            conn.close()
+
+            messagebox.showinfo(
+                "Success", f"Transaction marked as {new_status}."
+            )
+            self.staff_dashboard()
+
+        def call_next():
+            if current:
+                messagebox.showerror(
+                    "Error",
+                    "Complete or cancel the current transaction first."
+                )
+                return
+
+            conn = connect_db()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, queue_number
+                FROM queue_records
+                WHERE status = 'Waiting'
+                ORDER BY id
+                LIMIT 1
+            """)
+            record = cur.fetchone()
+
+            if not record:
+                conn.close()
+                messagebox.showinfo(
+                    "Queue Empty", "There are no waiting students."
+                )
+                return
+
+            cur.execute("""
+                UPDATE queue_records
+                SET status = 'Serving', window_id = ?
+                WHERE id = ? AND status = 'Waiting'
+            """, (self.current_window_id, record[0]))
+
+            conn.commit()
+            conn.close()
+
+            messagebox.showinfo(
+                "Now Serving",
+                f"Queue Number: {record[1]}\nProceed to {window_name}."
+            )
+            self.staff_dashboard()
+
+        button_frame = tk.Frame(current_frame)
+        button_frame.pack(pady=8)
+
+        tk.Button(
+            button_frame, text="Call Next",
+            command=call_next
+        ).pack(side="left", padx=5)
+
+        tk.Button(
+            button_frame, text="Complete Transaction",
+            command=lambda: update_status("Completed"),
+            state="normal" if current else "disabled"
+        ).pack(side="left", padx=5)
+
+        tk.Button(
+            button_frame, text="Cancel Transaction",
+            command=lambda: update_status("Cancelled"),
+            state="normal" if current else "disabled"
+        ).pack(side="left", padx=5)
+
+        waiting_frame = tk.LabelFrame(
+            self.root, text="Waiting Queue", padx=5, pady=5
+        )
+        waiting_frame.pack(fill="both", expand=True, padx=15, pady=5)
+
+        columns = ("Queue", "Student ID", "Name", "Service", "Registered")
+        tree = ttk.Treeview(
+            waiting_frame, columns=columns, show="headings", height=10
+        )
+
+        for col in columns:
+            tree.heading(col, text=col)
+            tree.column(col, width=150)
+
+        tree.pack(fill="both", expand=True)
+
+        for record in get_records(status="Waiting"):
+            tree.insert(
+                "", "end",
+                values=(record[0], record[1], record[2],
+                        record[3], record[4])
+            )
+
+        buttons = tk.Frame(self.root)
+        buttons.pack(pady=5)
+
+        tk.Button(
+            buttons, text="Refresh",
+            command=self.staff_dashboard
+        ).pack(side="left", padx=5)
+
+        tk.Button(
+            buttons, text="Back to Windows",
+            command=self.window_selection
+        ).pack(side="left", padx=5)
+
+        tk.Button(
+            buttons, text="Logout",
+            command=self.main_menu
+        ).pack(side="left", padx=5)
+
+    def admin_dashboard(self):
+        self.clear_screen()
+        self.heading("ADMIN DASHBOARD")
+
+        total, counts = get_statistics()
+
+        stats = tk.LabelFrame(
+            self.root, text="Queue Statistics", padx=10, pady=10
+        )
+        stats.pack(fill="x", padx=15, pady=5)
+
+        tk.Label(
+            stats,
+            text=f"Total Registered: {total}    "
+                 f"Waiting: {counts['Waiting']}    "
+                 f"Serving: {counts['Serving']}    "
+                 f"Completed: {counts['Completed']}    "
+                 f"Cancelled: {counts['Cancelled']}"
+        ).pack()
+
+        controls = tk.Frame(self.root)
+        controls.pack(pady=8)
+
+        tk.Button(
+            controls, text="View Queue Records",
+            command=self.admin_records
+        ).grid(row=0, column=0, padx=5, pady=5)
+
+        tk.Button(
+            controls, text="Manage Service Windows",
+            command=self.manage_windows
+        ).grid(row=0, column=1, padx=5, pady=5)
+
+        tk.Button(
+            controls, text="View Queue History",
+            command=self.queue_history
+        ).grid(row=1, column=0, padx=5, pady=5)
+
+        tk.Button(
+            controls, text="Reset Active Queue",
+            command=self.reset_queue
+        ).grid(row=1, column=1, padx=5, pady=5)
+
+        tk.Button(
+            controls, text="Logout",
+            command=self.main_menu
+        ).grid(row=2, column=0, columnspan=2, pady=5)
+
+        window_frame = tk.LabelFrame(
+            self.root, text="Service Windows", padx=5, pady=5
+        )
+        window_frame.pack(fill="both", expand=True, padx=15, pady=5)
+
+        columns = ("Window", "Status")
+        tree = ttk.Treeview(
+            window_frame, columns=columns, show="headings", height=8
+        )
+
+        tree.heading("Window", text="Window")
+        tree.heading("Status", text="Status")
+        tree.column("Window", width=250)
+        tree.column("Status", width=200)
+        tree.pack(fill="both", expand=True)
+
+        for window_id, name, active in get_windows():
+            if not active:
+                status = "Inactive"
+            elif get_window_status(window_id):
+                status = "Serving"
+            else:
+                status = "Available"
+
+            tree.insert("", "end", values=(name, status))
+
+    def admin_records(self):
+        self.clear_screen()
+        self.heading("QUEUE RECORDS")
+
+        filters = tk.Frame(self.root)
+        filters.pack(fill="x", padx=10)
+
+        tk.Label(filters, text="Search:").pack(side="left")
+        search_entry = tk.Entry(filters, width=25)
+        search_entry.pack(side="left", padx=5)
+
+        tk.Label(filters, text="Status:").pack(side="left", padx=5)
+        status_box = ttk.Combobox(
+            filters,
+            values=["All", "Waiting", "Serving", "Completed", "Cancelled"],
+            state="readonly",
+            width=15
+        )
+        status_box.set("All")
+        status_box.pack(side="left", padx=5)
+
+        columns = (
+            "Queue", "Student ID", "Name", "Service",
+            "Registered", "Status", "Window"
+        )
+
+        tree = ttk.Treeview(
+            self.root, columns=columns, show="headings", height=18
+        )
+
+        widths = [85, 100, 150, 140, 150, 100, 100]
+        for col, width in zip(columns, widths):
+            tree.heading(col, text=col)
+            tree.column(col, width=width)
+
+        tree.pack(fill="both", expand=True, padx=10, pady=10)
+
+        def refresh():
+            for item in tree.get_children():
+                tree.delete(item)
+
+            records = get_records(
+                status_box.get(), search_entry.get().strip()
+            )
+
+            for record in records:
+                tree.insert(
+                    "", "end",
+                    values=(
+                        record[0], record[1], record[2], record[3],
+                        record[4], record[5], record[6]
+                    )
+                )
+
+        tk.Button(
+            filters, text="Search / Filter", command=refresh
+        ).pack(side="left", padx=5)
+
+        tk.Button(
+            filters, text="Clear",
+            command=lambda: (
+                search_entry.delete(0, tk.END),
+                status_box.set("All"),
+                refresh()
+            )
+        ).pack(side="left", padx=5)
+
+        tk.Button(
+            self.root, text="Back",
+            command=self.admin_dashboard
+        ).pack(pady=5)
+
+        refresh()
+
+    def manage_windows(self):
+        self.clear_screen()
+        self.heading("MANAGE SERVICE WINDOWS")
+
+        columns = ("ID", "Window Name", "Status")
+        tree = ttk.Treeview(
+            self.root, columns=columns, show="headings", height=15
+        )
+
+        tree.heading("ID", text="ID")
+        tree.heading("Window Name", text="Window Name")
+        tree.heading("Status", text="Status")
+
+        tree.column("ID", width=80)
+        tree.column("Window Name", width=250)
+        tree.column("Status", width=150)
+
+        tree.pack(fill="both", expand=True, padx=15, pady=10)
+
+        def refresh():
+            for item in tree.get_children():
+                tree.delete(item)
+
+            for window_id, name, active in get_windows():
+                status = "Active" if active else "Inactive"
+                tree.insert(
+                    "", "end", values=(window_id, name, status)
+                )
+
+        def selected_window():
+            selection = tree.selection()
+            if not selection:
+                messagebox.showerror(
+                    "Error", "Please select a service window."
+                )
+                return None
+            return tree.item(selection[0])["values"]
+
+        def add_window():
+            name = simpledialog.askstring(
+                "Add Window", "Enter the new window name:", parent=self.root
+            )
+
+            if not name or not name.strip():
+                return
+
+            try:
+                conn = connect_db()
+                conn.execute(
+                    "INSERT INTO service_windows (window_name, active) VALUES (?, 1)",
+                    (name.strip(),)
+                )
+                conn.commit()
+                conn.close()
+                refresh()
+            except sqlite3.IntegrityError:
+                messagebox.showerror(
+                    "Error", "A window with that name already exists."
+                )
+
+        def edit_window():
+            row = selected_window()
+            if not row:
+                return
+
+            new_name = simpledialog.askstring(
+                "Edit Window",
+                "Enter the new window name:",
+                initialvalue=row[1],
+                parent=self.root
+            )
+
+            if not new_name or not new_name.strip():
+                return
+
+            try:
+                conn = connect_db()
+                conn.execute(
+                    "UPDATE service_windows SET window_name = ? WHERE id = ?",
+                    (new_name.strip(), row[0])
+                )
+                conn.commit()
+                conn.close()
+                refresh()
+            except sqlite3.IntegrityError:
+                messagebox.showerror(
+                    "Error", "That window name already exists."
+                )
+
+        def toggle_window():
+            row = selected_window()
+            if not row:
+                return
+
+            window_id = row[0]
+
+            conn = connect_db()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT active FROM service_windows WHERE id = ?",
+                (window_id,)
+            )
+            active = cur.fetchone()[0]
+
+            if active:
+                cur.execute("""
+                    SELECT COUNT(*) FROM queue_records
+                    WHERE window_id = ? AND status = 'Serving'
+                """, (window_id,))
+                serving = cur.fetchone()[0]
+
+                if serving:
+                    conn.close()
+                    messagebox.showerror(
+                        "Cannot Deactivate",
+                        "This window is currently serving a student."
+                    )
+                    return
+
+            cur.execute(
+                "UPDATE service_windows SET active = ? WHERE id = ?",
+                (0 if active else 1, window_id)
+            )
+            conn.commit()
+            conn.close()
+            refresh()
+
+        buttons = tk.Frame(self.root)
+        buttons.pack(pady=8)
+
+        tk.Button(
+            buttons, text="Add Window", command=add_window
+        ).pack(side="left", padx=5)
+
+        tk.Button(
+            buttons, text="Edit Window", command=edit_window
+        ).pack(side="left", padx=5)
+
+        tk.Button(
+            buttons, text="Activate / Deactivate",
+            command=toggle_window
+        ).pack(side="left", padx=5)
+
+        tk.Button(
+            buttons, text="Refresh", command=refresh
+        ).pack(side="left", padx=5)
+
+        tk.Button(
+            buttons, text="Back",
+            command=self.admin_dashboard
+        ).pack(side="left", padx=5)
+
+        refresh()
+
+    def queue_history(self):
+        self.clear_screen()
+        self.heading("QUEUE HISTORY")
+
+        columns = (
+            "Queue", "Student ID", "Name",
+            "Service", "Status", "Window", "Registered"
+        )
+
+        tree = ttk.Treeview(
+            self.root, columns=columns, show="headings", height=20
+        )
+
+        for col in columns:
+            tree.heading(col, text=col)
+            tree.column(col, width=130)
+
+        tree.pack(fill="both", expand=True, padx=10, pady=10)
+
+        for record in get_records():
+            if record[5] in ("Completed", "Cancelled"):
+                tree.insert(
+                    "", "end",
+                    values=(
+                        record[0], record[1], record[2], record[3],
+                        record[5], record[6], record[4]
+                    )
+                )
+
+        tk.Button(
+            self.root, text="Back",
+            command=self.admin_dashboard
+        ).pack(pady=5)
+
+    def reset_queue(self):
+        confirm = messagebox.askyesno(
+            "Confirm Reset",
+            "Reset the active queue?\n\n"
+            "Waiting records will be cancelled. "
+            "Completed and cancelled history will be preserved."
+        )
+
+        if not confirm:
+            return
+
+        conn = connect_db()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE queue_records
+            SET status = 'Cancelled'
+            WHERE status IN ('Waiting', 'Serving')
+        """)
+        conn.commit()
+        conn.close()
+
+        messagebox.showinfo(
+            "Queue Reset", "The active queue has been reset."
+        )
+        self.admin_dashboard()
+
+
+if __name__ == "__main__":
+    setup_database()
+    root = tk.Tk()
+    app = RegistrarApp(root)
+    root.mainloop()
